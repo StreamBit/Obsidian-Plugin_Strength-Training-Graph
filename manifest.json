@@ -1,0 +1,10 @@
+{
+  "id": "strength-training-graphs",
+  "name": "Strength Training Graphs",
+  "version": "0.1.0",
+  "minAppVersion": "1.5.0",
+  "description": "Plots strength training exercise metrics over time from frontmatter.",
+  "author": "StreamBit",
+  "authorUrl": "",
+  "isDesktopOnly": false
+}
