@@ -56,6 +56,13 @@ interface CsvExportRow {
   plotted_metric: string;
 }
 
+interface ChartExportDetails {
+  title: string;
+  xAxisTitle: string;
+  yAxisTitle: string;
+  legend: Array<{ label: string; color: string; dashArray: string }>;
+}
+
 function parseISOToUtcMs(iso: string): number | undefined {
   if (!/^\d{4}-\d{2}-\d{2}$/.test(iso)) return undefined;
   const ms = Date.parse(`${iso}T12:00:00Z`);
@@ -202,6 +209,8 @@ export class StrengthChartsView extends ItemView {
   volumeDisplayUnit: VolumeDisplayUnit = "lbs";
 
   private currentSvg: SVGSVGElement | null = null;
+  private currentExportDetails: ChartExportDetails | null = null;
+  private currentTooltip: HTMLDivElement | null = null;
   private lastVisibleRows: CsvExportRow[] = [];
 
   constructor(leaf: WorkspaceLeaf, plugin: StrengthTrainingGraphsPlugin) {
@@ -220,6 +229,10 @@ export class StrengthChartsView extends ItemView {
 
   async onOpen(): Promise<void> {
     this.render();
+  }
+
+  async onClose(): Promise<void> {
+    this.destroyTooltip();
   }
 
   private getSelectionCap(): number {
@@ -305,6 +318,13 @@ export class StrengthChartsView extends ItemView {
     if (this.metricMode === "weight") return entry.weight_lbs;
     if (derived.volume_lbs === undefined) return undefined;
     return toVolumeDisplay(derived.volume_lbs, this.volumeDisplayUnit);
+  }
+
+  private getMetricAxisTitle(): string {
+    if (this.metricMode === "reps") return "Total reps";
+    if (this.metricMode === "sets") return "Sets";
+    if (this.metricMode === "weight") return "Weight (lb)";
+    return `Volume (${volumeUnitLabel(this.volumeDisplayUnit)})`;
   }
 
   private getSeriesStyle(index: number, totalSeries: number): { color: string; dashArray: string } {
@@ -395,14 +415,150 @@ export class StrengthChartsView extends ItemView {
     setTimeout(() => URL.revokeObjectURL(url), 1000);
   }
 
+  private destroyTooltip(): void {
+    this.currentTooltip?.remove();
+    this.currentTooltip = null;
+  }
+
+  private getThemeColor(cssVar: string, fallback: string): string {
+    return getComputedStyle(this.containerEl).getPropertyValue(cssVar).trim() || fallback;
+  }
+
+  private getExportSvgString(): string {
+    if (!this.currentSvg) return "";
+
+    const exportSvg = this.currentSvg.cloneNode(true) as SVGSVGElement;
+    const exportInkColor = "#ffffff";
+
+    exportSvg.querySelectorAll("text").forEach((el) => {
+      el.setAttribute("fill", exportInkColor);
+    });
+
+    exportSvg.querySelectorAll("line").forEach((el) => {
+      const stroke = el.getAttribute("stroke");
+      if (stroke === "var(--text-normal)") {
+        el.setAttribute("stroke", exportInkColor);
+      } else if (stroke === "var(--background-modifier-border)") {
+        el.setAttribute("stroke", exportInkColor);
+        el.setAttribute("opacity", "0.18");
+      }
+    });
+
+    exportSvg.querySelectorAll("circle").forEach((el) => {
+      el.setAttribute("fill", exportInkColor);
+    });
+
+    return new XMLSerializer().serializeToString(exportSvg);
+  }
+
+  private parseDashArray(dashArray: string): number[] {
+    return dashArray
+      .split(/\s+/)
+      .map((part) => Number(part))
+      .filter((value) => Number.isFinite(value) && value > 0);
+  }
+
+  private getLegendRowCount(
+    ctx: CanvasRenderingContext2D,
+    legend: ChartExportDetails["legend"],
+    maxWidth: number
+  ): number {
+    if (legend.length === 0) return 0;
+    let rows = 1;
+    let x = 0;
+    for (const item of legend) {
+      const itemWidth = 42 + ctx.measureText(item.label).width + 16;
+      if (x > 0 && x + itemWidth > maxWidth) {
+        rows++;
+        x = 0;
+      }
+      x += itemWidth;
+    }
+    return rows;
+  }
+
+  private drawLegend(
+    ctx: CanvasRenderingContext2D,
+    legend: ChartExportDetails["legend"],
+    xStart: number,
+    yStart: number,
+    maxWidth: number,
+    textColor: string
+  ): void {
+    let x = xStart;
+    let y = yStart;
+    const rowHeight = 24;
+    ctx.font = "12px sans-serif";
+    ctx.textAlign = "left";
+    ctx.textBaseline = "middle";
+
+    for (const item of legend) {
+      const itemWidth = 42 + ctx.measureText(item.label).width + 16;
+      if (x > xStart && x + itemWidth > xStart + maxWidth) {
+        x = xStart;
+        y += rowHeight;
+      }
+
+      ctx.save();
+      ctx.strokeStyle = item.color;
+      ctx.lineWidth = 3;
+      ctx.setLineDash(this.parseDashArray(item.dashArray));
+      ctx.beginPath();
+      ctx.moveTo(x, y);
+      ctx.lineTo(x + 28, y);
+      ctx.stroke();
+      ctx.restore();
+
+      ctx.fillStyle = textColor;
+      ctx.fillText(item.label, x + 38, y);
+      x += itemWidth;
+    }
+  }
+
+  private setTooltipContent(
+    tooltip: HTMLDivElement,
+    title: string,
+    rows: Array<{ label: string; value: string }>
+  ): void {
+    tooltip.empty();
+    tooltip.createDiv({ cls: "stg-tooltip-title", text: title });
+    for (const row of rows) {
+      const rowEl = tooltip.createDiv({ cls: "stg-tooltip-row" });
+      rowEl.createSpan({ cls: "stg-tooltip-key", text: `${row.label}:` });
+      rowEl.createSpan({ cls: "stg-tooltip-value", text: row.value });
+    }
+  }
+
+  private positionTooltip(tooltip: HTMLDivElement, evt: MouseEvent): void {
+    const offset = 12;
+    const padding = 8;
+    const rect = tooltip.getBoundingClientRect();
+    const viewportWidth = window.innerWidth || document.documentElement.clientWidth;
+    const viewportHeight = window.innerHeight || document.documentElement.clientHeight;
+
+    let left = evt.clientX + offset;
+    let top = evt.clientY + offset;
+
+    if (left + rect.width + padding > viewportWidth) {
+      left = evt.clientX - rect.width - offset;
+    }
+    if (top + rect.height + padding > viewportHeight) {
+      top = evt.clientY - rect.height - offset;
+    }
+
+    left = Math.max(padding, Math.min(left, viewportWidth - rect.width - padding));
+    top = Math.max(padding, Math.min(top, viewportHeight - rect.height - padding));
+    tooltip.style.left = `${Math.round(left)}px`;
+    tooltip.style.top = `${Math.round(top)}px`;
+  }
+
   private async handleCopyPng(): Promise<void> {
     if (!this.currentSvg) {
       new Notice("No chart available to copy.");
       return;
     }
 
-    const serializer = new XMLSerializer();
-    const svgString = serializer.serializeToString(this.currentSvg);
+    const svgString = this.getExportSvgString();
     const svgBlob = new Blob([svgString], { type: "image/svg+xml;charset=utf-8" });
     const svgUrl = URL.createObjectURL(svgBlob);
 
@@ -415,16 +571,78 @@ export class StrengthChartsView extends ItemView {
       });
 
       const vb = this.currentSvg.viewBox.baseVal;
-      const width = vb.width > 0 ? Math.round(vb.width) : Math.max(this.currentSvg.clientWidth, 800);
-      const height = vb.height > 0 ? Math.round(vb.height) : Math.max(this.currentSvg.clientHeight, 420);
+      const chartWidth = vb.width > 0 ? Math.round(vb.width) : Math.max(this.currentSvg.clientWidth, 800);
+      const chartHeight = vb.height > 0 ? Math.round(vb.height) : Math.max(this.currentSvg.clientHeight, 420);
+      const details = this.currentExportDetails;
+      const padding = 24;
+      const leftAxisWidth = details ? 46 : 0;
+      const titleHeight = details ? 54 : 0;
+      const xAxisHeight = details ? 42 : 0;
+      const exportWidth = Math.max(chartWidth + leftAxisWidth + padding * 2, details ? 720 : chartWidth);
+      const chartX = padding + leftAxisWidth;
+      const chartY = padding + titleHeight;
+      const chartDrawWidth = exportWidth - chartX - padding;
+      const chartScale = chartDrawWidth / chartWidth;
+      const chartDrawHeight = Math.round(chartHeight * chartScale);
+      const measureCanvas = document.createElement("canvas");
+      const measureCtx = measureCanvas.getContext("2d");
+      if (!measureCtx) throw new Error("Unable to prepare canvas.");
+      measureCtx.font = "12px sans-serif";
+      const legendRows = details ? this.getLegendRowCount(measureCtx, details.legend, exportWidth - padding * 2) : 0;
+      const legendHeight = details && legendRows > 0 ? 30 + legendRows * 24 : 0;
+      const width = exportWidth;
+      const height = chartY + chartDrawHeight + xAxisHeight + legendHeight + padding;
       const canvas = document.createElement("canvas");
       canvas.width = width;
       canvas.height = height;
       const ctx = canvas.getContext("2d");
       if (!ctx) throw new Error("Unable to prepare canvas.");
-      ctx.fillStyle = getComputedStyle(this.containerEl).getPropertyValue("--background-primary").trim() || "#ffffff";
+      const backgroundColor = this.getThemeColor("--background-primary", "#ffffff");
+      const exportInkColor = "#ffffff";
+      ctx.fillStyle = backgroundColor;
       ctx.fillRect(0, 0, width, height);
-      ctx.drawImage(img, 0, 0, width, height);
+
+      if (details) {
+        ctx.fillStyle = exportInkColor;
+        ctx.font = "700 20px sans-serif";
+        ctx.textAlign = "center";
+        ctx.textBaseline = "alphabetic";
+        ctx.fillText(details.title, width / 2, padding + 8);
+
+        ctx.fillStyle = exportInkColor;
+        ctx.font = "12px sans-serif";
+        ctx.fillText(details.yAxisTitle, width / 2, padding + 30);
+      }
+
+      ctx.drawImage(img, chartX, chartY, chartDrawWidth, chartDrawHeight);
+
+      if (details) {
+        ctx.save();
+        ctx.fillStyle = exportInkColor;
+        ctx.font = "600 13px sans-serif";
+        ctx.textAlign = "center";
+        ctx.textBaseline = "middle";
+        ctx.translate(padding + 12, chartY + chartDrawHeight / 2);
+        ctx.rotate(-Math.PI / 2);
+        ctx.fillText(details.yAxisTitle, 0, 0);
+        ctx.restore();
+
+        ctx.fillStyle = exportInkColor;
+        ctx.font = "600 13px sans-serif";
+        ctx.textAlign = "center";
+        ctx.textBaseline = "middle";
+        ctx.fillText(details.xAxisTitle, chartX + chartDrawWidth / 2, chartY + chartDrawHeight + 28);
+
+        if (details.legend.length > 0) {
+          const legendTitleY = chartY + chartDrawHeight + xAxisHeight + 8;
+          ctx.fillStyle = exportInkColor;
+          ctx.font = "700 12px sans-serif";
+          ctx.textAlign = "left";
+          ctx.textBaseline = "middle";
+          ctx.fillText("Legend", padding, legendTitleY);
+          this.drawLegend(ctx, details.legend, padding, legendTitleY + 22, width - padding * 2, exportInkColor);
+        }
+      }
 
       const pngBlob = await new Promise<Blob>((resolve, reject) => {
         canvas.toBlob((blob) => {
@@ -680,7 +898,8 @@ export class StrengthChartsView extends ItemView {
     ];
     for (const opt of metricOptions) {
       const label = metricGroupEl.createEl("label", { cls: "stg-radio" });
-      const input = label.createEl("input", { type: "radio", name: "stg-metric" });
+      const input = label.createEl("input", { type: "radio" });
+      input.name = "stg-metric";
       input.checked = this.metricMode === opt.value;
       input.addEventListener("change", () => {
         this.metricMode = opt.value;
@@ -790,9 +1009,11 @@ export class StrengthChartsView extends ItemView {
     diagnosticsEl: HTMLDivElement,
     allExercises: string[]
   ): void {
+    this.destroyTooltip();
     chartEl.empty();
     summaryEl.empty();
     this.currentSvg = null;
+    this.currentExportDetails = null;
     this.lastVisibleRows = [];
 
     const selected = allExercises.filter((name) => this.selectedExercises.has(name));
@@ -885,8 +1106,16 @@ export class StrengthChartsView extends ItemView {
       text: summary.total !== undefined ? `${formatNumber(summary.total, 2)} ${unit}` : "n/a",
     });
 
+    const visibleSeries = series.filter((x) => x.points.length > 0);
+    this.currentExportDetails = {
+      title: "Strength Progression",
+      xAxisTitle: "Date",
+      yAxisTitle: this.getMetricAxisTitle(),
+      legend: visibleSeries.map((s) => ({ label: s.exerciseName, color: s.color, dashArray: s.dashArray })),
+    };
+
     const legendEl = chartEl.createDiv({ cls: "stg-legend" });
-    for (const s of series.filter((x) => x.points.length > 0)) {
+    for (const s of visibleSeries) {
       const item = legendEl.createDiv({ cls: "stg-legend-item" });
       const swatch = item.createDiv({ cls: "stg-legend-swatch" });
       swatch.style.borderColor = s.color;
@@ -998,8 +1227,11 @@ export class StrengthChartsView extends ItemView {
       })
     );
 
-    const tooltip = host.createDiv({ cls: "stg-tooltip" });
-    tooltip.hide();
+    const tooltip = this.containerEl.ownerDocument.createElement("div");
+    tooltip.className = "stg-tooltip";
+    tooltip.style.display = "none";
+    this.containerEl.ownerDocument.body.appendChild(tooltip);
+    this.currentTooltip = tooltip;
 
     for (const s of series) {
       if (s.points.length === 0) continue;
@@ -1049,31 +1281,43 @@ export class StrengthChartsView extends ItemView {
         circle.addEventListener("mouseenter", (evt) => {
           const volumeDisplayed =
             p.derived.volume_lbs !== undefined ? toVolumeDisplay(p.derived.volume_lbs, this.volumeDisplayUnit) : undefined;
-          tooltip.setText(
-            [
-              `${s.exerciseName}`,
-              `Date: ${p.entry.dateISO}`,
-              `Weight: ${p.entry.weight_lbs !== undefined ? `${formatNumber(p.entry.weight_lbs, 1)} lb` : "n/a"}`,
-              `Sets: ${p.entry.sets !== undefined ? formatNumber(p.entry.sets, 0) : "n/a"}`,
-              `Reps/set: ${p.entry.reps_per_set !== undefined ? formatNumber(p.entry.reps_per_set, 0) : "n/a"}`,
-              `Total reps: ${p.derived.totalReps !== undefined ? formatNumber(p.derived.totalReps, 0) : "n/a"}`,
-              `Volume: ${formatVolume(volumeDisplayed, this.volumeDisplayUnit)}`,
-              `e1RM (Epley): ${p.derived.e1rmEpley_lbs !== undefined ? `${formatNumber(p.derived.e1rmEpley_lbs, 1)} lb` : "n/a"}`,
-              `e1RM (Brzycki): ${p.derived.e1rmBrzycki_lbs !== undefined ? `${formatNumber(p.derived.e1rmBrzycki_lbs, 1)} lb` : "n/a"}`,
-              `Note: ${p.entry.sourceNotePath}`,
-            ].join("\n")
-          );
-          tooltip.show();
-          const hostRect = host.getBoundingClientRect();
-          tooltip.style.left = `${evt.clientX - hostRect.left + 12}px`;
-          tooltip.style.top = `${evt.clientY - hostRect.top + 12}px`;
+          this.setTooltipContent(tooltip, s.exerciseName, [
+            { label: "Date", value: p.entry.dateISO },
+            {
+              label: "Weight",
+              value: p.entry.weight_lbs !== undefined ? `${formatNumber(p.entry.weight_lbs, 1)} lb` : "n/a",
+            },
+            { label: "Sets", value: p.entry.sets !== undefined ? formatNumber(p.entry.sets, 0) : "n/a" },
+            {
+              label: "Reps/set",
+              value: p.entry.reps_per_set !== undefined ? formatNumber(p.entry.reps_per_set, 0) : "n/a",
+            },
+            {
+              label: "Total reps",
+              value: p.derived.totalReps !== undefined ? formatNumber(p.derived.totalReps, 0) : "n/a",
+            },
+            { label: "Volume", value: formatVolume(volumeDisplayed, this.volumeDisplayUnit) },
+            {
+              label: "e1RM (Epley)",
+              value: p.derived.e1rmEpley_lbs !== undefined ? `${formatNumber(p.derived.e1rmEpley_lbs, 1)} lb` : "n/a",
+            },
+            {
+              label: "e1RM (Brzycki)",
+              value: p.derived.e1rmBrzycki_lbs !== undefined ? `${formatNumber(p.derived.e1rmBrzycki_lbs, 1)} lb` : "n/a",
+            },
+            { label: "Note", value: p.entry.sourceNotePath },
+          ]);
+          tooltip.style.visibility = "hidden";
+          tooltip.style.display = "block";
+          this.positionTooltip(tooltip, evt);
+          tooltip.style.visibility = "";
         });
         circle.addEventListener("mousemove", (evt) => {
-          const hostRect = host.getBoundingClientRect();
-          tooltip.style.left = `${evt.clientX - hostRect.left + 12}px`;
-          tooltip.style.top = `${evt.clientY - hostRect.top + 12}px`;
+          this.positionTooltip(tooltip, evt);
         });
-        circle.addEventListener("mouseleave", () => tooltip.hide());
+        circle.addEventListener("mouseleave", () => {
+          tooltip.style.display = "none";
+        });
         circle.addEventListener("click", () => {
           void this.openSourceNote(p.entry.sourceNotePath);
         });
